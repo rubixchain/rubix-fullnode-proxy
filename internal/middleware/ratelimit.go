@@ -1,10 +1,14 @@
-package main
+package middleware
 
 import (
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	"rubix-fullnode-proxy/internal/constants"
+	"rubix-fullnode-proxy/internal/response"
+	"rubix-fullnode-proxy/internal/util"
 )
 
 type visitor struct {
@@ -15,8 +19,8 @@ type visitor struct {
 type RateLimiter struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
-	rate     float64 // tokens per second
-	burst    float64 // max tokens (allows short bursts)
+	rate     float64
+	burst    float64
 }
 
 func NewRateLimiter(requestsPerMinute int, burst int) *RateLimiter {
@@ -57,12 +61,12 @@ func (rl *RateLimiter) Allow(ip string) bool {
 }
 
 func (rl *RateLimiter) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(constants.RateLimitCleanupInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		rl.mu.Lock()
 		for ip, v := range rl.visitors {
-			if time.Since(v.lastSeen) > 5*time.Minute {
+			if time.Since(v.lastSeen) > constants.RateLimitStaleThreshold {
 				delete(rl.visitors, ip)
 			}
 		}
@@ -70,19 +74,17 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
-func RateLimitMiddleware(limiter *RateLimiter) func(http.Handler) http.Handler {
+func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := getClientIP(r)
+			ip := util.GetClientIP(r)
 			if !limiter.Allow(ip) {
 				slog.Warn("Rate limit exceeded",
 					slog.String("client_ip", ip),
 					slog.String("path", r.URL.Path),
 				)
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("Retry-After", "60")
-				w.WriteHeader(http.StatusTooManyRequests)
-				w.Write([]byte(`{"status":false,"message":"Too Many Requests"}`))
+				w.Header().Set(constants.HeaderRetryAfter, constants.RetryAfterSeconds)
+				response.JSON(w, http.StatusTooManyRequests, constants.ResponseTooManyRequests)
 				return
 			}
 			next.ServeHTTP(w, r)

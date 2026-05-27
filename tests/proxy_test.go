@@ -1,4 +1,4 @@
-package main
+package tests
 
 import (
 	"io"
@@ -7,10 +7,14 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"rubix-fullnode-proxy/internal/constants"
+	"rubix-fullnode-proxy/internal/middleware"
+	"rubix-fullnode-proxy/internal/proxy"
+	"rubix-fullnode-proxy/internal/response"
 )
 
 func TestProxyFlow(t *testing.T) {
-	// 1. Start a mock Rubix Fullnode upstream server
 	mockFullnodeReceivedReq := false
 	var receivedHeaders http.Header
 	var receivedBody string
@@ -29,42 +33,34 @@ func TestProxyFlow(t *testing.T) {
 	}))
 	defer mockFullnode.Close()
 
-	// 2. Parse mock fullnode URL
 	targetURL, err := url.Parse(mockFullnode.URL)
 	if err != nil {
 		t.Fatalf("Failed to parse mock fullnode URL: %v", err)
 	}
 
-	// 3. Set up the Proxy Mux/Handler
 	mux := http.NewServeMux()
 
-	// Public health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy"}`))
+		response.JSON(w, http.StatusOK, constants.ResponseHealthy)
 	})
 
 	const secretKey = "test-auth-secret-key"
-	proxyHandler := NewReverseProxy(targetURL)
+	proxyHandler := proxy.NewReverseProxy(targetURL)
 	var protectedHandler http.Handler = proxyHandler
-	protectedHandler = WhitelistMiddleware(protectedHandler)
-	protectedHandler = AuthMiddleware(secretKey)(protectedHandler)
+	protectedHandler = proxy.Whitelist(protectedHandler)
+	protectedHandler = middleware.Auth(secretKey)(protectedHandler)
 
 	mux.Handle("/", protectedHandler)
 
-	// Apply global logging and recovery
 	var mainHandler http.Handler = mux
-	mainHandler = LoggingMiddleware(mainHandler)
-	mainHandler = RecoveryMiddleware(mainHandler)
+	mainHandler = middleware.Logging(mainHandler)
+	mainHandler = middleware.Recovery(mainHandler)
 
-	// Start proxy server locally using httptest
 	proxyServer := httptest.NewServer(mainHandler)
 	defer proxyServer.Close()
 
 	client := &http.Client{}
 
-	// Test Case 1: Public Health Check (No Auth needed)
 	t.Run("Health Check Success", func(t *testing.T) {
 		resp, err := client.Get(proxyServer.URL + "/health")
 		if err != nil {
@@ -77,7 +73,6 @@ func TestProxyFlow(t *testing.T) {
 		}
 	})
 
-	// Test Case 2: Whitelisted Path with Valid Auth Key & POST method (Success case)
 	t.Run("Valid Authorized Request Success", func(t *testing.T) {
 		mockFullnodeReceivedReq = false
 		payload := `{"token_ids": ["token_xyz_123"]}`
@@ -85,9 +80,9 @@ func TestProxyFlow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		req.Header.Set("X-API-KEY", secretKey)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Real-IP", "1.2.3.4")
+		req.Header.Set(constants.HeaderAPIKey, secretKey)
+		req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		req.Header.Set(constants.HeaderXRealIP, "1.2.3.4")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -103,24 +98,21 @@ func TestProxyFlow(t *testing.T) {
 			t.Error("Mock Fullnode did not receive the request")
 		}
 
-		// Verify headers passed to upstream
-		if receivedHeaders.Get("X-Real-IP") != "1.2.3.4" {
-			t.Errorf("Expected X-Real-IP '1.2.3.4', got '%s'", receivedHeaders.Get("X-Real-IP"))
+		if receivedHeaders.Get(constants.HeaderXRealIP) != "1.2.3.4" {
+			t.Errorf("Expected X-Real-IP '1.2.3.4', got '%s'", receivedHeaders.Get(constants.HeaderXRealIP))
 		}
 
-		// Verify payload was received unchanged
 		if receivedBody != payload {
 			t.Errorf("Expected payload '%s', got '%s'", payload, receivedBody)
 		}
 	})
 
-	// Test Case 3: Invalid Auth Key → 401 Unauthorized
 	t.Run("Invalid API Key Unauthorized", func(t *testing.T) {
 		req, err := http.NewRequest("POST", proxyServer.URL+"/rubix/v1/fullnode/sync-token-chain", nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		req.Header.Set("X-API-KEY", "wrong-secret-key")
+		req.Header.Set(constants.HeaderAPIKey, "wrong-secret-key")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -133,19 +125,16 @@ func TestProxyFlow(t *testing.T) {
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		expected := `{"status":false,"message":"Unauthorized: Invalid or missing X-API-KEY"}`
-		if string(body) != expected {
-			t.Errorf("Expected body '%s', got '%s'", expected, string(body))
+		if string(body) != constants.ResponseUnauthorized {
+			t.Errorf("Expected body '%s', got '%s'", constants.ResponseUnauthorized, string(body))
 		}
 	})
 
-	// Test Case 4: Missing API Key → 401 Unauthorized
 	t.Run("Missing API Key Unauthorized", func(t *testing.T) {
 		req, err := http.NewRequest("POST", proxyServer.URL+"/rubix/v1/fullnode/sync-token-chain", nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		// No X-API-KEY header set
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -158,13 +147,12 @@ func TestProxyFlow(t *testing.T) {
 		}
 	})
 
-	// Test Case 5: Non-whitelisted Endpoint → 403 Forbidden
 	t.Run("Non-whitelisted Endpoint Forbidden", func(t *testing.T) {
 		req, err := http.NewRequest("POST", proxyServer.URL+"/rubix/v1/fullnode/invalid-endpoint", nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		req.Header.Set("X-API-KEY", secretKey)
+		req.Header.Set(constants.HeaderAPIKey, secretKey)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -177,19 +165,17 @@ func TestProxyFlow(t *testing.T) {
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		expected := `{"status":false,"message":"Forbidden"}`
-		if string(body) != expected {
-			t.Errorf("Expected body '%s', got '%s'", expected, string(body))
+		if string(body) != constants.ResponseForbidden {
+			t.Errorf("Expected body '%s', got '%s'", constants.ResponseForbidden, string(body))
 		}
 	})
 
-	// Test Case 6: Wrong HTTP method on whitelisted path → 403 Forbidden (spec: all non-matching = 403)
 	t.Run("Wrong Method on Whitelisted Path Forbidden", func(t *testing.T) {
 		req, err := http.NewRequest("GET", proxyServer.URL+"/rubix/v1/fullnode/sync-token-chain", nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		req.Header.Set("X-API-KEY", secretKey)
+		req.Header.Set(constants.HeaderAPIKey, secretKey)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -202,14 +188,12 @@ func TestProxyFlow(t *testing.T) {
 		}
 	})
 
-	// Test Case 7: Backend down → 502 with spec-mandated JSON
 	t.Run("Backend Unavailable Returns 502", func(t *testing.T) {
-		// Create a proxy pointing to a dead backend
-		deadURL, _ := url.Parse("http://127.0.0.1:19999") // nothing listening here
-		deadProxy := NewReverseProxy(deadURL)
+		deadURL, _ := url.Parse("http://127.0.0.1:19999")
+		deadProxy := proxy.NewReverseProxy(deadURL)
 		var deadHandler http.Handler = deadProxy
-		deadHandler = WhitelistMiddleware(deadHandler)
-		deadHandler = AuthMiddleware(secretKey)(deadHandler)
+		deadHandler = proxy.Whitelist(deadHandler)
+		deadHandler = middleware.Auth(secretKey)(deadHandler)
 
 		deadMux := http.NewServeMux()
 		deadMux.Handle("/", deadHandler)
@@ -221,8 +205,8 @@ func TestProxyFlow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		req.Header.Set("X-API-KEY", secretKey)
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(constants.HeaderAPIKey, secretKey)
+		req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -235,9 +219,8 @@ func TestProxyFlow(t *testing.T) {
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		expected := `{"status":false,"message":"Backend fullnode unavailable"}`
-		if string(body) != expected {
-			t.Errorf("Expected body '%s', got '%s'", expected, string(body))
+		if string(body) != constants.ResponseBadGateway {
+			t.Errorf("Expected body '%s', got '%s'", constants.ResponseBadGateway, string(body))
 		}
 	})
 }
