@@ -165,6 +165,8 @@ sudo systemctl enable --now rubix-proxy
 
 Nginx sits in front of the Go proxy to handle HTTPS. The Go proxy and Fullnode stay on localhost.
 
+> **Windows users:** follow [deployment/SETUP_WINDOWS.md](deployment/SETUP_WINDOWS.md) instead — it covers the full Windows install (nginx-for-Windows, cert generation, service-style background processes, and PowerShell verification commands). The rest of this section is Linux-specific.
+
 ### 1. Install
 
 ```bash
